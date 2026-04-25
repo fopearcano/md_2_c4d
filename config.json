@@ -1,0 +1,7 @@
+{
+  "export_folder": "./exports",
+  "default_format": "FBX",
+  "scale_factor": 1.0,
+  "axis_preset": "Y_UP",
+  "texture_folder": "./exports/textures"
+}
