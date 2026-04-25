@@ -48,11 +48,26 @@ md_2_c4d/
 │   ├── export_manifest.py
 │   ├── file_watcher.py
 │   └── utils.py
-└── marvelous_scripts/
-    ├── export_to_c4d_obj.py    # implemented
-    ├── export_to_c4d_fbx.py    # placeholder
-    └── export_to_c4d_abc.py    # placeholder
+├── marvelous_scripts/
+│   ├── export_to_c4d_obj.py    # implemented
+│   ├── export_to_c4d_fbx.py    # placeholder
+│   └── export_to_c4d_abc.py    # placeholder
+└── c4d_plugin/
+    ├── MD2C4D_Bridge.pyp       # CommandData plugin (OBJ import)
+    ├── README_C4D_INSTALL.md
+    └── res/                    # reserved for future plugin resources
 ```
+
+## Cinema 4D plugin
+
+`c4d_plugin/MD2C4D_Bridge.pyp` registers a single menu command,
+*Extensions -> MD2C4D Bridge: Import Latest*. It reads the same
+`config.json` and `manifest.json` used by the CLI, picks the most
+recent manifest entry, imports the OBJ into the active document under
+a `MD2C4D_<garment>` null, applies scale and axis correction from the
+manifest, and best-effort repairs material texture paths. FBX and
+Alembic importers are marked TODO. Install instructions live in
+[`c4d_plugin/README_C4D_INSTALL.md`](c4d_plugin/README_C4D_INSTALL.md).
 
 ## Marvelous Designer scripts
 
