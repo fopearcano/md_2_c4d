@@ -40,15 +40,30 @@ The C4D-side importer is intentionally *not* in this version.
 md_2_c4d/
 ├── README.md
 ├── config.json
-└── md_bridge/
-    ├── __init__.py
-    ├── __main__.py
-    ├── cli.py
-    ├── config.py
-    ├── export_manifest.py
-    ├── file_watcher.py
-    └── utils.py
+├── md_bridge/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── cli.py
+│   ├── config.py
+│   ├── export_manifest.py
+│   ├── file_watcher.py
+│   └── utils.py
+└── marvelous_scripts/
+    ├── export_to_c4d_obj.py    # implemented
+    ├── export_to_c4d_fbx.py    # placeholder
+    └── export_to_c4d_abc.py    # placeholder
 ```
+
+## Marvelous Designer scripts
+
+`marvelous_scripts/export_to_c4d_obj.py` is meant to be run from inside
+Marvelous Designer (`File -> Python Script -> Run Script`). It reads
+the same `config.json` used by the CLI, calls the MD Python API to
+export the open scene as OBJ into `export_folder`, then appends an
+entry to `manifest.json` via `md_bridge.export_manifest`.
+
+The FBX and ABC scripts are deliberate placeholders for now. See the
+docstring of each file for the implementation plan.
 
 ## Configuration
 
