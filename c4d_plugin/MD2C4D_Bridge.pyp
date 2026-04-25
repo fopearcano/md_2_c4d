@@ -1,28 +1,24 @@
 """MD2C4D Bridge — Cinema 4D import command.
 
-A minimal Cinema 4D plugin that reads the bridge ``config.json`` and
-the export-folder ``manifest.json`` produced by the MD-side scripts,
-then imports the most recent Marvelous Designer export into the active
-Cinema 4D document.
+A minimal Cinema 4D plugin that registers the *Import Latest MD Export*
+menu command. It delegates manifest parsing, validation, and "newest
+valid entry" selection to :mod:`md_bridge.export_resolver`, then loads
+the resolved file into the active Cinema 4D document under a single
+parent null whose transform encodes the bridge's scale and axis
+correction.
 
-What it does on each invocation
--------------------------------
-1. Locates ``config.json`` (env var ``MD2C4D_REPO_ROOT`` -> plugin's
-   parent dir -> CWD).
-2. Reads ``<export_folder>/manifest.json`` and picks the entry with
-   the most recent timestamp.
-3. Loads that geometry file into a temporary Cinema 4D document
-   (OBJ today; FBX/Alembic are TODO stubs).
-4. Creates a parent null named ``MD2C4D_<garment>`` in the active doc.
-5. Re-parents the imported objects under the null and copies the
-   imported materials across.
-6. Applies ``scale_factor`` and ``axis_preset`` from the manifest entry
-   to the parent null so a single transform governs the whole import.
-7. Tries to repair material texture paths from the manifest's
-   ``textures`` list; if no materials were imported but textures exist,
-   creates basic standard materials and assigns the first to the
-   imported meshes.
-8. Logs every step to the Cinema 4D Python console.
+The work is split into three small, testable steps:
+
+* :func:`resolve_latest_export` — wrap the bridge's resolver, return a
+  ``ResolvedExport``.
+* :func:`import_export_file` — load an OBJ/FBX/ABC file into a temp
+  Cinema 4D document and detach its top-level objects + materials.
+* :func:`parent_imported_objects` — create the ``MD2C4D_<garment>``
+  null, attach the imported items under it, and apply scale + axis.
+
+Refresh / replace behaviour for an already-imported garment is
+**not** in this version; running the command always inserts a fresh
+import.
 
 Install
 -------
@@ -31,7 +27,6 @@ See ``README_C4D_INSTALL.md`` next to this file.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import traceback
@@ -48,115 +43,113 @@ from c4d import documents, gui, plugins, utils
 # with a unique plugin ID issued by Maxon at https://plugincafe.maxon.net/
 # to avoid collisions with other third-party plugins.
 PLUGIN_ID = 1066666
-PLUGIN_NAME = "MD2C4D Bridge: Import Latest"
+PLUGIN_NAME = "Import Latest MD Export"
 PLUGIN_HELP = "Import the most recent Marvelous Designer export listed in manifest.json."
 
 
 # ---------------------------------------------------------------------------
-# Errors
+# Errors + logging
 # ---------------------------------------------------------------------------
 class BridgeError(RuntimeError):
     """Raised for any expected, user-facing failure during import."""
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 def log(msg: str) -> None:
     """Write to Cinema 4D's Python console with a consistent prefix."""
     print(f"[MD2C4D] {msg}")
 
 
 # ---------------------------------------------------------------------------
-# Config + manifest
+# Bridge-package bootstrap
 # ---------------------------------------------------------------------------
+# The plugin imports ``md_bridge.*`` from the bridge repo. We add the
+# repo root to ``sys.path`` at module import time so the regular
+# ``from md_bridge...`` lines below work. Resolution order matches the
+# previous plugin: env var -> plugin's parent dir -> cwd.
 def _candidate_repo_roots() -> list[Path]:
-    """Possible locations for the bridge repo, in priority order."""
     roots: list[Path] = []
     env = os.environ.get("MD2C4D_REPO_ROOT")
     if env:
         roots.append(Path(env).expanduser())
-    # The .pyp typically lives at <repo>/c4d_plugin/MD2C4D_Bridge.pyp,
-    # so the repo root is two levels up from this file.
     here = Path(__file__).resolve().parent
-    roots.append(here.parent)
+    roots.append(here.parent)  # <repo>/c4d_plugin/.. == <repo>
     roots.append(here)
     roots.append(Path.cwd())
     return roots
 
 
-def _find_repo_root() -> Path:
+def _bootstrap_repo_root() -> Path | None:
     for cand in _candidate_repo_roots():
-        if (cand / "config.json").exists():
+        if (cand / "config.json").exists() and (cand / "md_bridge").is_dir():
+            s = str(cand.resolve())
+            if s not in sys.path:
+                sys.path.insert(0, s)
             return cand.resolve()
-    raise BridgeError(
-        "config.json not found. Set MD2C4D_REPO_ROOT or place the plugin "
-        "inside the bridge repo's c4d_plugin/ folder."
+    return None
+
+
+_REPO_ROOT: Path | None = _bootstrap_repo_root()
+
+try:
+    from md_bridge.config import load_config  # type: ignore[import-not-found]
+    from md_bridge.export_resolver import (  # type: ignore[import-not-found]
+        ResolvedExport,
+        ResolverError,
+        resolve_latest,
     )
 
-
-def _load_config(root: Path) -> dict:
-    cfg_path = root / "config.json"
-    try:
-        with cfg_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except OSError as exc:
-        raise BridgeError(f"Cannot read {cfg_path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise BridgeError(f"{cfg_path} is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise BridgeError(f"{cfg_path} must contain a JSON object")
-    return data
-
-
-def _resolve_export_folder(cfg: dict, root: Path) -> Path:
-    raw = cfg.get("export_folder", "./exports")
-    p = Path(raw).expanduser()
-    if not p.is_absolute():
-        p = root / p
-    return p.resolve()
-
-
-def _load_latest_entry(export_folder: Path) -> dict:
-    manifest = export_folder / "manifest.json"
-    if not manifest.exists():
-        raise BridgeError(f"manifest.json not found at {manifest}")
-    try:
-        with manifest.open("r", encoding="utf-8") as fh:
-            entries = json.load(fh)
-    except json.JSONDecodeError as exc:
-        raise BridgeError(f"{manifest} is not valid JSON: {exc}") from exc
-    if not isinstance(entries, list) or not entries:
-        raise BridgeError(f"{manifest} is empty — nothing to import")
-    try:
-        latest = max(entries, key=lambda e: str(e.get("timestamp", "")))
-    except Exception:  # noqa: BLE001
-        latest = entries[-1]
-    if not isinstance(latest, dict) or "file" not in latest:
-        raise BridgeError("Latest manifest entry is malformed (missing 'file').")
-    return latest
+    _BRIDGE_OK = True
+    _BRIDGE_IMPORT_ERROR: Exception | None = None
+except Exception as _exc:  # noqa: BLE001 - any failure means we run in degraded mode
+    ResolvedExport = None  # type: ignore[assignment,misc]
+    ResolverError = Exception  # type: ignore[assignment,misc]
+    load_config = None  # type: ignore[assignment]
+    resolve_latest = None  # type: ignore[assignment]
+    _BRIDGE_OK = False
+    _BRIDGE_IMPORT_ERROR = _exc
 
 
 # ---------------------------------------------------------------------------
-# Geometry import
+# 1) resolve_latest_export
 # ---------------------------------------------------------------------------
-def _load_into_temp_doc(file_path: Path) -> "c4d.documents.BaseDocument":
-    """Load a file into a fresh document so we can inspect what came in.
+def resolve_latest_export() -> "ResolvedExport":
+    """Return the newest valid export described by the bridge manifest.
 
-    Cinema 4D's scene-loader chain auto-detects format from the path
-    extension, so OBJ, FBX and Alembic all flow through the same call.
+    Wraps :func:`md_bridge.export_resolver.resolve_latest`, surfacing a
+    single :class:`BridgeError` so callers only need to handle one
+    exception type.
     """
-    if not file_path.exists():
-        raise BridgeError(f"Export file does not exist: {file_path}")
-    # C4D API: LoadDocument returns a new BaseDocument, or None on failure.
-    temp = documents.LoadDocument(str(file_path), c4d.SCENEFILTER_OBJECTS | c4d.SCENEFILTER_MATERIALS)
-    if temp is None:
-        raise BridgeError(f"Cinema 4D failed to load {file_path}")
-    return temp
+    if not _BRIDGE_OK:
+        raise BridgeError(
+            f"md_bridge package is not importable: {_BRIDGE_IMPORT_ERROR}. "
+            "Install the plugin inside the bridge repo (so it lives at "
+            "<repo>/c4d_plugin/) or set the MD2C4D_REPO_ROOT environment "
+            "variable to the repo path."
+        )
+    if _REPO_ROOT is None:
+        raise BridgeError(
+            "config.json not found. Set MD2C4D_REPO_ROOT, or place the "
+            "plugin inside the bridge repo's c4d_plugin/ folder."
+        )
+
+    cfg_path = _REPO_ROOT / "config.json"
+    try:
+        cfg = load_config(cfg_path)
+    except FileNotFoundError as exc:
+        raise BridgeError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise BridgeError(f"Cannot read {cfg_path}: {exc}") from exc
+
+    try:
+        return resolve_latest(cfg)
+    except ResolverError as exc:
+        raise BridgeError(str(exc)) from exc
 
 
+# ---------------------------------------------------------------------------
+# 2) import_export_file
+# ---------------------------------------------------------------------------
 def _drain_top_objects(src_doc) -> list:
-    """Detach and return every top-level object from ``src_doc``."""
     out: list = []
     obj = src_doc.GetFirstObject()
     while obj is not None:
@@ -168,7 +161,6 @@ def _drain_top_objects(src_doc) -> list:
 
 
 def _drain_materials(src_doc) -> list:
-    """Detach and return every material from ``src_doc``."""
     out: list = []
     mat = src_doc.GetFirstMaterial()
     while mat is not None:
@@ -179,55 +171,60 @@ def _drain_materials(src_doc) -> list:
     return out
 
 
-def import_obj(file_path: Path) -> tuple[list, list]:
-    """Load an OBJ and return ``(top_objects, materials)`` detached from
-    the temporary document so the caller can re-parent them."""
-    temp = _load_into_temp_doc(file_path)
-    objs = _drain_top_objects(temp)
-    mats = _drain_materials(temp)
-    if not objs:
-        raise BridgeError(f"OBJ {file_path.name} contained no objects.")
-    log(f"OBJ load: {len(objs)} top-level object(s), {len(mats)} material(s)")
-    return objs, mats
+def _load_file_into_temp_doc(file_path: Path):
+    """Load an OBJ / FBX / ABC into a fresh BaseDocument."""
+    if not file_path.exists():
+        raise BridgeError(f"Export file does not exist: {file_path}")
+    # C4D API: LoadDocument auto-detects format from extension via the
+    # registered scene-loader plugins. Returns None on failure.
+    temp = documents.LoadDocument(
+        str(file_path),
+        c4d.SCENEFILTER_OBJECTS | c4d.SCENEFILTER_MATERIALS,
+    )
+    if temp is None:
+        raise BridgeError(f"Cinema 4D failed to load {file_path}")
+    return temp
 
 
-def import_fbx(file_path: Path) -> tuple[list, list]:
-    """TODO: FBX import.
+def import_export_file(file_path: Path, fmt: str) -> tuple[list, list]:
+    """Load a Marvelous Designer export and return ``(objects, materials)``.
 
-    Implementation sketch: identical to :func:`import_obj` — Cinema 4D's
-    scene loader handles ``.fbx`` natively via the same ``LoadDocument``
-    call. The work here is *post*-import: deciding what to do with FBX-
-    specific extras (cameras, lights, embedded animation) so we don't
-    silently dump them into the active scene. Until that policy is
-    settled this stays a stub.
+    The returned objects and materials are detached from the temporary
+    document so the caller can re-parent them. Today only OBJ is fully
+    wired up; FBX and Alembic are explicit TODO stubs that raise
+    :class:`BridgeError` when invoked.
     """
-    raise BridgeError("FBX import is not implemented yet (TODO).")
+    fmt_norm = (fmt or "").upper()
 
+    if fmt_norm == "OBJ":
+        temp = _load_file_into_temp_doc(file_path)
+        objs = _drain_top_objects(temp)
+        mats = _drain_materials(temp)
+        if not objs:
+            raise BridgeError(f"OBJ {file_path.name} contained no objects.")
+        log(f"OBJ load: {len(objs)} top-level object(s), {len(mats)} material(s)")
+        return objs, mats
 
-def import_abc(file_path: Path) -> tuple[list, list]:
-    """TODO: Alembic import.
+    if fmt_norm == "FBX":
+        # TODO: FBX import. LoadDocument will read the file; the open
+        # question is what to do with FBX-only payloads (cameras,
+        # lights, embedded animation) before they pollute the active
+        # scene.
+        raise BridgeError("FBX import is not implemented yet (TODO).")
 
-    Implementation sketch: ``LoadDocument`` will read the ABC, but for
-    cloth caches we usually want to wire the result up as an Alembic
-    Generator (``c4d.Oalembicgenerator``) pointing at the file rather
-    than baking geometry into the scene. That behaviour deserves its
-    own pass; until then this is a stub.
-    """
-    raise BridgeError("Alembic import is not implemented yet (TODO).")
+    if fmt_norm == "ABC":
+        # TODO: Alembic import. For animated cloth caches we likely
+        # want to wire the file up via c4d.Oalembicgenerator instead
+        # of baking geometry into the scene.
+        raise BridgeError("Alembic import is not implemented yet (TODO).")
 
-
-FORMAT_DISPATCH = {
-    "OBJ": import_obj,
-    "FBX": import_fbx,
-    "ABC": import_abc,
-}
+    raise BridgeError(f"Unsupported format: {fmt!r}")
 
 
 # ---------------------------------------------------------------------------
-# Scene assembly
+# 3) parent_imported_objects
 # ---------------------------------------------------------------------------
-def _make_parent_null(garment: str, scale: float, axis: str) -> "c4d.BaseObject":
-    """Create the ``MD2C4D_<garment>`` null with scale + axis applied."""
+def _make_parent_null(garment: str, scale: float, axis: str):
     null = c4d.BaseObject(c4d.Onull)
     null.SetName(f"MD2C4D_{garment}")
 
@@ -235,9 +232,9 @@ def _make_parent_null(garment: str, scale: float, axis: str) -> "c4d.BaseObject"
         null.SetRelScale(c4d.Vector(scale, scale, scale))
 
     # Axis preset: only Y_UP and Z_UP are defined in the bridge config.
-    # MD's native frame is Y_UP; Cinema 4D is Y_UP. For Z_UP we apply a
-    # -90 deg rotation about X (Pitch) on the parent null so a single
-    # transform corrects the whole import.
+    # MD's native frame is Y_UP; Cinema 4D is Y_UP. For Z_UP we apply
+    # a -90 deg rotation about X (Pitch) on the parent null so a
+    # single transform corrects the whole import.
     axis_norm = (axis or "Y_UP").upper()
     if axis_norm == "Z_UP":
         null.SetRelRot(c4d.Vector(0.0, utils.DegToRad(-90.0), 0.0))
@@ -247,13 +244,27 @@ def _make_parent_null(garment: str, scale: float, axis: str) -> "c4d.BaseObject"
     return null
 
 
-def _attach_imported(doc, null, objs: list, mats: list) -> None:
-    """Insert null + imported items into ``doc`` with undo support."""
+def parent_imported_objects(
+    doc,
+    objs: list,
+    mats: list,
+    *,
+    garment: str,
+    scale: float,
+    axis: str,
+):
+    """Create the ``MD2C4D_<garment>`` null and attach imported items.
+
+    All inserts are wrapped in a single ``StartUndo``/``EndUndo`` block
+    so a single ``Ctrl+Z`` reverses the entire import. Returns the
+    parent null.
+    """
+    null = _make_parent_null(garment, scale, axis)
+
     doc.StartUndo()
     try:
-        # C4D API: insert objects/materials, then register them with the
-        # undo stack using UNDOTYPE_NEW so a single Ctrl+Z reverses the
-        # whole import.
+        # C4D API: insert objects/materials, then register them with
+        # the undo stack using UNDOTYPE_NEW.
         doc.InsertObject(null)
         doc.AddUndo(c4d.UNDOTYPE_NEW, null)
 
@@ -267,9 +278,11 @@ def _attach_imported(doc, null, objs: list, mats: list) -> None:
     finally:
         doc.EndUndo()
 
+    return null
+
 
 # ---------------------------------------------------------------------------
-# Material repair
+# Material repair (best-effort, kept from the previous version)
 # ---------------------------------------------------------------------------
 def _bitmap_filename(shader) -> str:
     if shader is None:
@@ -288,8 +301,7 @@ def _find_matching_texture(name: str, textures: list[str]) -> str | None:
     return None
 
 
-def _make_basic_material(name: str, texture_path: str) -> "c4d.BaseMaterial":
-    """Build a minimal standard material with a bitmap in the colour channel."""
+def _make_basic_material(name: str, texture_path: str):
     mat = c4d.BaseMaterial(c4d.Mmaterial)
     mat.SetName(name)
     shader = c4d.BaseShader(c4d.Xbitmap)
@@ -301,29 +313,24 @@ def _make_basic_material(name: str, texture_path: str) -> "c4d.BaseMaterial":
 
 
 def _assign_material(obj, mat) -> None:
-    """Drop a Texture Tag onto ``obj`` using UVW projection."""
     tag = obj.MakeTag(c4d.Ttexture)
     tag[c4d.TEXTURETAG_MATERIAL] = mat
     tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_UVW
 
 
-def repair_or_create_materials(
+def _repair_or_create_materials(
     doc,
     mats: list,
     target_objects: list,
-    manifest_entry: dict,
+    texture_paths: list[str],
 ) -> tuple[int, int]:
     """Patch broken texture paths and synthesise fallback materials.
 
-    Returns ``(repaired_count, created_count)`` for logging.
+    Returns ``(repaired_count, created_count)``.
     """
-    textures = [t for t in manifest_entry.get("textures", []) if isinstance(t, str)]
     repaired = 0
     created = 0
 
-    # Pass 1: repair any standard material whose colour-channel bitmap
-    # points at a missing file by swapping in a manifest-listed texture
-    # whose stem matches the material name.
     for mat in mats:
         if mat.GetType() != c4d.Mmaterial:
             continue
@@ -331,7 +338,7 @@ def repair_or_create_materials(
         path = _bitmap_filename(shader)
         if path and Path(path).exists():
             continue
-        match = _find_matching_texture(mat.GetName(), textures)
+        match = _find_matching_texture(mat.GetName(), texture_paths)
         if not match:
             continue
         if shader is not None and shader.GetType() == c4d.Xbitmap:
@@ -344,11 +351,8 @@ def repair_or_create_materials(
         mat.Update(True, True)
         repaired += 1
 
-    # Pass 2: if the import produced zero materials but the manifest
-    # lists textures, build basic materials and tag them onto every
-    # imported top-level object so the user sees something rendered.
-    if not mats and textures and target_objects:
-        for tex in textures:
+    if not mats and texture_paths and target_objects:
+        for tex in texture_paths:
             mat = _make_basic_material(Path(tex).stem or "MD2C4D_tex", tex)
             doc.InsertMaterial(mat)
             doc.AddUndo(c4d.UNDOTYPE_NEW, mat)
@@ -365,42 +369,35 @@ def repair_or_create_materials(
 # Top-level orchestration
 # ---------------------------------------------------------------------------
 def run_import(doc) -> None:
-    root = _find_repo_root()
-    log(f"repo root: {root}")
+    export = resolve_latest_export()
+    log(f"resolved: {export.format} '{export.garment}' @ {export.timestamp}")
+    log(f"file: {export.file}")
+    if export.textures_missing:
+        log(f"warning: {export.textures_missing} manifest texture(s) missing on disk")
 
-    cfg = _load_config(root)
-    export_folder = _resolve_export_folder(cfg, root)
-    log(f"export folder: {export_folder}")
+    objs, mats = import_export_file(export.file, export.format)
 
-    entry = _load_latest_entry(export_folder)
-    fmt = str(entry.get("format", "")).upper()
-    garment = str(entry.get("garment") or Path(entry["file"]).stem)
-    scale = float(entry.get("scale_factor", cfg.get("scale_factor", 1.0)))
-    axis = str(entry.get("axis_preset", cfg.get("axis_preset", "Y_UP")))
+    null = parent_imported_objects(
+        doc,
+        objs,
+        mats,
+        garment=export.garment,
+        scale=export.scale_factor,
+        axis=export.axis_preset,
+    )
+    log(
+        f"created parent null: {null.GetName()} "
+        f"(scale={export.scale_factor}, axis={export.axis_preset})"
+    )
 
-    file_path = Path(entry["file"])
-    if not file_path.is_absolute():
-        file_path = (export_folder / file_path).resolve()
-
-    log(f"importing {fmt} '{garment}' from {file_path}")
-
-    importer = FORMAT_DISPATCH.get(fmt)
-    if importer is None:
-        raise BridgeError(f"Unsupported format in manifest: {fmt!r}")
-
-    objs, mats = importer(file_path)
-
-    null = _make_parent_null(garment, scale, axis)
-    _attach_imported(doc, null, objs, mats)
-    log(f"created parent null: {null.GetName()} (scale={scale}, axis={axis})")
-
-    repaired, created = repair_or_create_materials(doc, mats, objs, entry)
+    texture_strings = [str(p) for p in export.textures]
+    repaired, created = _repair_or_create_materials(doc, mats, objs, texture_strings)
     if repaired:
         log(f"repaired {repaired} material texture path(s)")
     if created:
         log(f"created {created} fallback material(s) from manifest textures")
 
-    # C4D API: refresh viewport/Object Manager so the user sees the result.
+    # C4D API: refresh viewport / Object Manager so the user sees the result.
     c4d.EventAdd()
     log("import complete")
 
@@ -409,19 +406,23 @@ def run_import(doc) -> None:
 # Plugin command
 # ---------------------------------------------------------------------------
 class ImportLatestCommand(plugins.CommandData):
-    """Menu command entry point."""
+    """Menu command entry point — *Import Latest MD Export*."""
 
     def Execute(self, doc):  # noqa: N802 - C4D API name
         try:
             run_import(doc)
         except BridgeError as exc:
+            # Expected user-facing failure: log + dialog, no traceback.
             log(f"aborted: {exc}")
             gui.MessageDialog(f"MD2C4D Bridge:\n\n{exc}")
             return False
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - never let C4D crash on us
             log(f"unexpected error: {exc}")
             traceback.print_exc()
-            gui.MessageDialog(f"MD2C4D Bridge: unexpected error\n\n{exc}")
+            gui.MessageDialog(
+                "MD2C4D Bridge: unexpected error\n\n"
+                f"{exc}\n\nSee the Python console for the full traceback."
+            )
             return False
         return True
 
@@ -442,9 +443,14 @@ def _register() -> None:
         icon=None,
     )
     if ok:
-        print(f"[MD2C4D] registered command plugin {PLUGIN_ID}: {PLUGIN_NAME}")
+        log(f"registered command plugin {PLUGIN_ID}: {PLUGIN_NAME}")
+        if not _BRIDGE_OK:
+            log(
+                f"warning: md_bridge import failed at startup ({_BRIDGE_IMPORT_ERROR}); "
+                "the command will fail until the repo is reachable."
+            )
     else:
-        print(f"[MD2C4D] FAILED to register command plugin {PLUGIN_ID}")
+        log(f"FAILED to register command plugin {PLUGIN_ID}")
 
 
 if __name__ == "__main__":
