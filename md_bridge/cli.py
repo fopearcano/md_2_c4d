@@ -10,6 +10,7 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH, load_config, write_default_config
 from .export_manifest import manifest_path, record_export
+from .export_resolver import ResolverError, resolve_latest
 from .file_watcher import (
     DEFAULT_INTERVAL,
     DEFAULT_STABLE_ROUNDS,
@@ -68,6 +69,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wm_p.add_argument("file", help="Path to the exported OBJ/FBX/ABC file.")
 
+    latest_p = sub.add_parser(
+        "latest",
+        help="Print info about the newest valid export in manifest.json.",
+    )
+    latest_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the formatted table.",
+    )
+
     return parser
 
 
@@ -105,10 +116,31 @@ def cmd_write_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_latest(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    export = resolve_latest(cfg)
+
+    if args.json:
+        print(json.dumps(export.to_dict(), indent=2))
+        return 0
+
+    print("[md_bridge] latest export:")
+    print(f"  garment:    {export.garment}")
+    print(f"  format:     {export.format}")
+    print(f"  file:       {export.file}")
+    print(f"  timestamp:  {export.timestamp}")
+    tex_line = f"  textures:   {len(export.textures)}"
+    if export.textures_missing:
+        tex_line += f" ({export.textures_missing} missing)"
+    print(tex_line)
+    return 0
+
+
 COMMANDS = {
     "init": cmd_init,
     "watch": cmd_watch,
     "write-manifest": cmd_write_manifest,
+    "latest": cmd_latest,
 }
 
 
@@ -122,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         # load_config raises this when config.json is missing.
         print(f"[md_bridge] {exc}", file=sys.stderr)
         return 1
-    except WatcherError as exc:
+    except (WatcherError, ResolverError) as exc:
         print(f"[md_bridge] {exc}", file=sys.stderr)
         return 1
 
